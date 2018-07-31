@@ -16,6 +16,7 @@ from pyro.distributions.testing.rejection_gamma import ShapeAugmentedGamma
 from pyro.infer import SVI, config_enumerate
 from pyro.infer.enum import iter_discrete_traces
 from pyro.infer.traceenum_elbo import TraceEnum_ELBO
+from pyro.util import torch_isnan
 from tests.common import assert_equal
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,8 @@ def test_avoid_nan(enumerate1):
                           strict_enumeration_warning=any([enumerate1]))
     loss = elbo.loss(model, guide)
     assert not math.isnan(loss), loss
+    loss = elbo.differentiable_loss(model, guide)
+    assert not torch_isnan(loss), loss
     loss = elbo.loss_and_grads(model, guide)
     assert not math.isnan(loss), loss
 
@@ -205,6 +208,35 @@ def test_svi_step_smoke(model, guide, enumerate1):
     inference.step(data)
 
 
+@pytest.mark.parametrize("model,guide", [
+    (gmm_model, gmm_guide),
+    (gmm_batch_model, gmm_batch_guide),
+], ids=["single", "batch"])
+@pytest.mark.parametrize("enumerate1", [None, "sequential", "parallel"])
+def test_differentiable_loss(model, guide, enumerate1):
+    pyro.clear_param_store()
+    data = torch.tensor([0.0, 1.0, 9.0])
+
+    guide = config_enumerate(guide, default=enumerate1)
+    elbo = TraceEnum_ELBO(max_iarange_nesting=1,
+                          strict_enumeration_warning=any([enumerate1]))
+
+    pyro.set_rng_seed(0)
+    loss = elbo.differentiable_loss(model, guide, data)
+    param_names = sorted(pyro.get_param_store().get_all_param_names())
+    actual_loss = loss.item()
+    actual_grads = grad(loss, [pyro.param(name).unconstrained() for name in param_names])
+
+    pyro.set_rng_seed(0)
+    expected_loss = elbo.loss_and_grads(model, guide, data)
+    expected_grads = [pyro.param(name).unconstrained().grad for name in param_names]
+
+    assert_equal(actual_loss, expected_loss)
+    for name, actual_grad, expected_grad in zip(param_names, actual_grads, expected_grads):
+        assert_equal(actual_grad, expected_grad, msg='bad {} gradient. Expected:\n{}\nActual:\n{}'.format(
+            name, expected_grad, actual_grad))
+
+
 @pytest.mark.parametrize("enumerate1", [None, "sequential", "parallel"])
 def test_svi_step_guide_uses_grad(enumerate1):
     data = torch.tensor([0., 1., 3.])
@@ -239,9 +271,9 @@ def test_svi_step_guide_uses_grad(enumerate1):
     inference.step()
 
 
-@pytest.mark.parametrize("quantity", ["loss", "grad"])
+@pytest.mark.parametrize("method", ["loss", "differentiable_loss", "loss_and_grads"])
 @pytest.mark.parametrize("enumerate1", [None, "sequential", "parallel"])
-def test_elbo_bern(quantity, enumerate1):
+def test_elbo_bern(method, enumerate1):
     pyro.clear_param_store()
     num_particles = 1 if enumerate1 else 10000
     prec = 0.001 if enumerate1 else 0.1
@@ -261,7 +293,7 @@ def test_elbo_bern(quantity, enumerate1):
     elbo = TraceEnum_ELBO(max_iarange_nesting=1,
                           strict_enumeration_warning=any([enumerate1]))
 
-    if quantity == "loss":
+    if method == "loss":
         actual = elbo.loss(model, guide) / num_particles
         expected = kl.item()
         assert_equal(actual, expected, prec=prec, msg="".join([
@@ -269,8 +301,12 @@ def test_elbo_bern(quantity, enumerate1):
             "\n  actual = {}".format(actual),
         ]))
     else:
-        elbo.loss_and_grads(model, guide)
-        actual = q.grad / num_particles
+        if method == "differentiable_loss":
+            loss = elbo.differentiable_loss(model, guide)
+            actual = grad(loss, [q])[0] / num_particles
+        elif method == "loss_and_grads":
+            elbo.loss_and_grads(model, guide)
+            actual = q.grad / num_particles
         expected = grad(kl, [q])[0]
         assert_equal(actual, expected, prec=prec, msg="".join([
             "\nexpected = {}".format(expected.detach().cpu().numpy()),
@@ -281,33 +317,39 @@ def test_elbo_bern(quantity, enumerate1):
 @pytest.mark.parametrize("enumerate1", [None, "sequential", "parallel"])
 @pytest.mark.parametrize("enumerate2", [None, "sequential", "parallel"])
 @pytest.mark.parametrize("enumerate3", [None, "sequential", "parallel"])
-def test_elbo_berns(enumerate1, enumerate2, enumerate3):
+@pytest.mark.parametrize("method", ["differentiable_loss", "loss_and_grads"])
+def test_elbo_berns(method, enumerate1, enumerate2, enumerate3):
     pyro.clear_param_store()
     num_particles = 1 if all([enumerate1, enumerate2, enumerate3]) else 10000
     prec = 0.001 if all([enumerate1, enumerate2, enumerate3]) else 0.1
     q = pyro.param("q", torch.tensor(0.75, requires_grad=True))
 
     def model():
-        with pyro.iarange("particles", num_particles):
-            pyro.sample("x1", dist.Bernoulli(0.1).expand_by([num_particles]))
-            pyro.sample("x2", dist.Bernoulli(0.2).expand_by([num_particles]))
-            pyro.sample("x3", dist.Bernoulli(0.3).expand_by([num_particles]))
+        pyro.sample("x1", dist.Bernoulli(0.1))
+        pyro.sample("x2", dist.Bernoulli(0.2))
+        pyro.sample("x3", dist.Bernoulli(0.3))
 
     def guide():
         q = pyro.param("q")
-        with pyro.iarange("particles", num_particles):
-            pyro.sample("x1", dist.Bernoulli(q).expand_by([num_particles]), infer={"enumerate": enumerate1})
-            pyro.sample("x2", dist.Bernoulli(q).expand_by([num_particles]), infer={"enumerate": enumerate2})
-            pyro.sample("x3", dist.Bernoulli(q).expand_by([num_particles]), infer={"enumerate": enumerate3})
+        pyro.sample("x1", dist.Bernoulli(q), infer={"enumerate": enumerate1})
+        pyro.sample("x2", dist.Bernoulli(q), infer={"enumerate": enumerate2})
+        pyro.sample("x3", dist.Bernoulli(q), infer={"enumerate": enumerate3})
 
     kl = sum(kl_divergence(dist.Bernoulli(q), dist.Bernoulli(p)) for p in [0.1, 0.2, 0.3])
     expected_loss = kl.item()
     expected_grad = grad(kl, [q])[0]
 
-    elbo = TraceEnum_ELBO(max_iarange_nesting=1,
+    elbo = TraceEnum_ELBO(max_iarange_nesting=0,
+                          num_particles=num_particles,
+                          vectorize_particles=True,
                           strict_enumeration_warning=any([enumerate1, enumerate2, enumerate3]))
-    actual_loss = elbo.loss_and_grads(model, guide) / num_particles
-    actual_grad = q.grad / num_particles
+    if method == "differentiable_loss":
+        loss = elbo.differentiable_loss(model, guide)
+        actual_loss = loss.item()
+        actual_grad = grad(loss, [q])[0]
+    else:
+        actual_loss = elbo.loss_and_grads(model, guide)
+        actual_grad = q.grad
 
     assert_equal(actual_loss, expected_loss, prec=prec, msg="".join([
         "\nexpected loss = {}".format(expected_loss),
@@ -462,31 +504,31 @@ def test_elbo_iarange_iarange(outer_dim, inner_dim, enumerate1, enumerate2, enum
     q = pyro.param("q", torch.tensor(0.75, requires_grad=True))
     p = 0.2693204236205713  # for which kl(Bernoulli(q), Bernoulli(p)) = 0.5
 
+    @poutine.broadcast
     def model():
         d = dist.Bernoulli(p)
-        with pyro.iarange("particles", num_particles):
-            context1 = pyro.iarange("outer", outer_dim, dim=-2)
-            context2 = pyro.iarange("inner", inner_dim, dim=-3)
-            pyro.sample("w", d.expand_by([num_particles]))
-            with context1:
-                pyro.sample("x", d.expand_by([outer_dim, num_particles]))
-            with context2:
-                pyro.sample("y", d.expand_by([inner_dim, 1, num_particles]))
-            with context1, context2:
-                pyro.sample("z", d.expand_by([inner_dim, outer_dim, num_particles]))
+        context1 = pyro.iarange("outer", outer_dim, dim=-1)
+        context2 = pyro.iarange("inner", inner_dim, dim=-2)
+        pyro.sample("w", d)
+        with context1:
+            pyro.sample("x", d)
+        with context2:
+            pyro.sample("y", d)
+        with context1, context2:
+            pyro.sample("z", d)
 
+    @poutine.broadcast
     def guide():
         d = dist.Bernoulli(pyro.param("q"))
-        with pyro.iarange("particles", num_particles):
-            context1 = pyro.iarange("outer", outer_dim, dim=-2)
-            context2 = pyro.iarange("inner", inner_dim, dim=-3)
-            pyro.sample("w", d.expand_by([num_particles]), infer={"enumerate": enumerate1})
-            with context1:
-                pyro.sample("x", d.expand_by([outer_dim, num_particles]), infer={"enumerate": enumerate2})
-            with context2:
-                pyro.sample("y", d.expand_by([inner_dim, 1, num_particles]), infer={"enumerate": enumerate3})
-            with context1, context2:
-                pyro.sample("z", d.expand_by([inner_dim, outer_dim, num_particles]), infer={"enumerate": enumerate4})
+        context1 = pyro.iarange("outer", outer_dim, dim=-1)
+        context2 = pyro.iarange("inner", inner_dim, dim=-2)
+        pyro.sample("w", d, infer={"enumerate": enumerate1})
+        with context1:
+            pyro.sample("x", d, infer={"enumerate": enumerate2})
+        with context2:
+            pyro.sample("y", d, infer={"enumerate": enumerate3})
+        with context1, context2:
+            pyro.sample("z", d, infer={"enumerate": enumerate4})
 
     kl_node = kl_divergence(dist.Bernoulli(q), dist.Bernoulli(p))
     kl = (1 + outer_dim + inner_dim + outer_dim * inner_dim) * kl_node
@@ -494,9 +536,11 @@ def test_elbo_iarange_iarange(outer_dim, inner_dim, enumerate1, enumerate2, enum
     expected_grad = grad(kl, [q])[0]
 
     elbo = TraceEnum_ELBO(max_iarange_nesting=3,
+                          num_particles=num_particles,
+                          vectorize_particles=True,
                           strict_enumeration_warning=any([enumerate1, enumerate2, enumerate3]))
-    actual_loss = elbo.loss_and_grads(model, guide) / num_particles
-    actual_grad = pyro.param('q').grad / num_particles
+    actual_loss = elbo.loss_and_grads(model, guide)
+    actual_grad = pyro.param('q').grad
 
     assert_equal(actual_loss, expected_loss, prec=0.1, msg="".join([
         "\nexpected loss = {}".format(expected_loss),

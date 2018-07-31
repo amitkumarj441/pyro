@@ -2,25 +2,19 @@ from __future__ import absolute_import, division, print_function
 
 import warnings
 import weakref
+from collections import defaultdict
 
 import torch
+from six.moves import queue
 
 import pyro
 import pyro.ops.jit
 import pyro.poutine as poutine
 from pyro.distributions.util import is_identically_zero
 from pyro.infer.elbo import ELBO
-from pyro.infer.enum import iter_discrete_traces
+from pyro.infer.enum import get_importance_trace, iter_discrete_escape, iter_discrete_extend
 from pyro.infer.util import Dice, is_validation_enabled
-from pyro.poutine.util import prune_subsample_sites
-from pyro.util import check_model_guide_match, check_site_shape, check_traceenum_requirements, torch_isnan
-
-
-def _dict_iadd(dict_, key, value):
-    if key in dict_:
-        dict_[key] = dict_[key] + value
-    else:
-        dict_[key] = value
+from pyro.util import check_traceenum_requirements, warn_if_nan
 
 
 def _compute_dice_elbo(model_trace, guide_trace):
@@ -31,25 +25,15 @@ def _compute_dice_elbo(model_trace, guide_trace):
                 for name, site in trace.nodes.items()
                 if site["type"] == "sample"}
 
-    costs = {}
+    costs = defaultdict(float)
     for name, site in model_trace.nodes.items():
         if site["type"] == "sample":
-            _dict_iadd(costs, ordering[name], site["log_prob"])
+            costs[ordering[name]] = costs[ordering[name]] + site["log_prob"]
     for name, site in guide_trace.nodes.items():
         if site["type"] == "sample":
-            _dict_iadd(costs, ordering[name], -site["log_prob"])
+            costs[ordering[name]] = costs[ordering[name]] - site["log_prob"]
 
-    dice = Dice(guide_trace, ordering)
-    elbo = 0.0
-    for ordinal, cost in costs.items():
-        dice_prob = dice.in_context(cost.shape, ordinal)
-        mask = dice_prob > 0
-        if torch.is_tensor(mask) and not mask.all():
-            dice_prob = dice_prob[mask]
-            cost = cost[mask]
-        # TODO use score_parts.entropy_term to "stick the landing"
-        elbo = elbo + (dice_prob * cost).sum()
-    return elbo
+    return Dice(guide_trace, ordering).compute_expectation(costs)
 
 
 class TraceEnum_ELBO(ELBO):
@@ -67,49 +51,52 @@ class TraceEnum_ELBO(ELBO):
     variables inside that :class:`~pyro.iarange`.
     """
 
+    def _get_trace(self, model, guide, *args, **kwargs):
+        """
+        Returns a single trace from the guide, and the model that is run
+        against it.
+        """
+        model_trace, guide_trace = get_importance_trace(
+            "flat", self.max_iarange_nesting, model, guide, *args, **kwargs)
+
+        if is_validation_enabled():
+            check_traceenum_requirements(model_trace, guide_trace)
+
+            enumerated_sites = [name for name, site in guide_trace.nodes.items()
+                                if site["type"] == "sample"
+                                and site["infer"].get("enumerate", None)]
+
+            if self.strict_enumeration_warning and len(enumerated_sites) == 0:
+                warnings.warn('TraceEnum_ELBO found no sample sites configured for enumeration. '
+                              'If you want to enumerate sites, you need to @config_enumerate or set '
+                              'infer={"enumerate": "sequential"} or infer={"enumerate": "parallel"}? '
+                              'If you do not want to enumerate, consider using Trace_ELBO instead.')
+
+        return model_trace, guide_trace
+
     def _get_traces(self, model, guide, *args, **kwargs):
         """
-        runs the guide and runs the model against the guide with
-        the result packaged as a trace generator
+        Runs the guide and runs the model against the guide with
+        the result packaged as a trace generator.
         """
-        # enable parallel enumeration
+        if self.vectorize_particles:
+            guide = self._vectorized_num_particles(guide)
+            model = self._vectorized_num_particles(model)
+
+        # enable parallel enumeration over the vectorized guide.
         guide = poutine.enum(guide, first_available_dim=self.max_iarange_nesting)
-
-        for i in range(self.num_particles):
-            for guide_trace in iter_discrete_traces("flat", guide, *args, **kwargs):
-                model_trace = poutine.trace(poutine.replay(model, trace=guide_trace),
-                                            graph_type="flat").get_trace(*args, **kwargs)
-
-                if is_validation_enabled():
-                    check_model_guide_match(model_trace, guide_trace, self.max_iarange_nesting)
-                guide_trace = prune_subsample_sites(guide_trace)
-                model_trace = prune_subsample_sites(model_trace)
-                if is_validation_enabled():
-                    check_traceenum_requirements(model_trace, guide_trace)
-
-                model_trace.compute_log_prob()
-                guide_trace.compute_score_parts()
-                if is_validation_enabled():
-                    for site in model_trace.nodes.values():
-                        if site["type"] == "sample":
-                            check_site_shape(site, self.max_iarange_nesting)
-                    any_enumerated = False
-                    for site in guide_trace.nodes.values():
-                        if site["type"] == "sample":
-                            check_site_shape(site, self.max_iarange_nesting)
-                            if site["infer"].get("enumerate"):
-                                any_enumerated = True
-                    if self.strict_enumeration_warning and not any_enumerated:
-                        warnings.warn('TraceEnum_ELBO found no sample sites configured for enumeration. '
-                                      'If you want to enumerate sites, you need to @config_enumerate or set '
-                                      'infer={"enumerate": "sequential"} or infer={"enumerate": "parallel"}? '
-                                      'If you do not want to enumerate, consider using Trace_ELBO instead.')
-
-                yield model_trace, guide_trace
+        q = queue.LifoQueue()
+        guide = poutine.queue(guide, q,
+                              escape_fn=iter_discrete_escape,
+                              extend_fn=iter_discrete_extend)
+        for i in range(1 if self.vectorize_particles else self.num_particles):
+            q.put(poutine.Trace())
+            while not q.empty():
+                yield self._get_trace(model, guide, *args, **kwargs)
 
     def loss(self, model, guide, *args, **kwargs):
         """
-        :returns: returns an estimate of the ELBO
+        :returns: an estimate of the ELBO
         :rtype: float
 
         Estimates the ELBO using ``num_particles`` many samples (particles).
@@ -123,13 +110,39 @@ class TraceEnum_ELBO(ELBO):
             elbo += elbo_particle.item() / self.num_particles
 
         loss = -elbo
-        if torch_isnan(loss):
-            warnings.warn('Encountered NAN loss')
+        warn_if_nan(loss, "loss")
+        return loss
+
+    def differentiable_loss(self, model, guide, *args, **kwargs):
+        """
+        :returns: a differentiable estimate of the ELBO
+        :rtype: torch.Tensor
+        :raises ValueError: if the ELBO is not differentiable (e.g. is
+            identically zero)
+
+        Estimates a differentiable ELBO using ``num_particles`` many samples
+        (particles).  The result should be infinitely differentiable (as long
+        as underlying derivatives have been implemented).
+        """
+        elbo = 0.0
+        for model_trace, guide_trace in self._get_traces(model, guide, *args, **kwargs):
+            elbo_particle = _compute_dice_elbo(model_trace, guide_trace)
+            if is_identically_zero(elbo_particle):
+                continue
+
+            elbo = elbo + elbo_particle
+        elbo = elbo / self.num_particles
+
+        if not torch.is_tensor(elbo) or not elbo.requires_grad:
+            raise ValueError('ELBO is cannot be differentiated: {}'.format(elbo))
+
+        loss = -elbo
+        warn_if_nan(loss, "loss")
         return loss
 
     def loss_and_grads(self, model, guide, *args, **kwargs):
         """
-        :returns: returns an estimate of the ELBO
+        :returns: an estimate of the ELBO
         :rtype: float
 
         Estimates the ELBO using ``num_particles`` many samples (particles).
@@ -153,8 +166,7 @@ class TraceEnum_ELBO(ELBO):
                 (loss_particle / self.num_particles).backward(retain_graph=True)
 
         loss = -elbo
-        if torch_isnan(loss):
-            warnings.warn('Encountered NAN loss')
+        warn_if_nan(loss, "loss")
         return loss
 
 
@@ -193,6 +205,5 @@ class JitTraceEnum_ELBO(TraceEnum_ELBO):
         differentiable_loss.backward()  # this line triggers jit compilation
         loss = differentiable_loss.item()
 
-        if torch_isnan(loss):
-            warnings.warn('Encountered NAN loss')
+        warn_if_nan(loss, "loss")
         return loss

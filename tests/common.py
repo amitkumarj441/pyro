@@ -13,7 +13,6 @@ import torch.cuda
 from numpy.testing import assert_allclose
 from pytest import approx
 
-torch.set_default_tensor_type(os.environ.get('PYRO_TENSOR_TYPE', 'torch.DoubleTensor'))
 
 """
 Contains test utilities for assertions, approximate comparison (of tensors and other objects).
@@ -136,16 +135,16 @@ def _safe_coalesce(t):
 
     new_indices = sorted(list(value_map.keys()))
     new_values = [value_map[idx] for idx in new_indices]
-    if t._values().ndimension() < 2:
-        new_values = t._values().new(new_values)
+    if t._values().dim() < 2:
+        new_values = t._values().new_tensor(new_values)
     else:
         new_values = torch.stack(new_values)
 
-    new_indices = t._indices().new(new_indices).t()
+    new_indices = t._indices().new_tensor(new_indices).t()
     tg = t.new(new_indices, new_values, t.size())
 
-    assert tc._indices() == tg._indices()
-    assert tc._values() == tg._values()
+    assert (tc._indices() == tg._indices()).all()
+    assert (tc._values() == tg._values()).all()
     return tg
 
 

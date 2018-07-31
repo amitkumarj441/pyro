@@ -188,28 +188,22 @@ def torch_sign(value):
     return torch.sign(value)
 
 
-def matrix_triangular_solve_compat(b, A, upper=True):
-    """
-    Computes the solution to the linear equation AX = b,
-    where A is a triangular matrix.
+try:
+    from torch import logsumexp  # for pytorch 0.4.1 and later
+except ImportError:
+    def logsumexp(tensor, dim=-1):
+        """
+        Numerically stable implementation for the `LogSumExp` operation. The
+        summing is done along the dimension specified by ``dim``.
 
-    :param b: A 1D or 2D tensor of size N or N x C.
-    :param A: A 2D tensor of size N X N.
-    :param upper: A flag if A is a upper triangular matrix or not.
-    """
-    return b.view(b.shape[0], -1).trtrs(A, upper=upper)[0].view(b.shape)
+        :param torch.Tensor tensor: Input tensor.
+        :param dim: Dimension to be summed out.
+        """
+        max_val = tensor.max(dim)[0]
+        return max_val + (tensor - max_val.unsqueeze(dim)).exp().sum(dim=dim).log()
 
 
-def log_sum_exp(tensor, dim=-1):
-    """
-    Numerically stable implementation for the `LogSumExp` operation. The
-    summing is done along the dimension specified by ``dim``.
-
-    :param torch.Tensor tensor: Input tensor.
-    :param dim: Dimension to be summed out.
-    """
-    max_val = tensor.max(dim)[0]
-    return max_val + (tensor - max_val.unsqueeze(-1)).exp().sum(dim=dim).log()
+log_sum_exp = logsumexp  # DEPRECATED
 
 
 def enable_validation(is_validate):

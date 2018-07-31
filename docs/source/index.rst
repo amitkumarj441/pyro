@@ -32,6 +32,8 @@ Pyro Documentation
    contrib.autoguide
    contrib.autoname
    contrib.gp
+   contrib.tracking
+   contrib.oed
 
 
 Indices and tables

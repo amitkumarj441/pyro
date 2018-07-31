@@ -19,9 +19,7 @@ from pyro.infer.mcmc.mcmc import MCMC
 from pyro.params import param_with_module_name
 from tests.common import assert_equal
 
-logging.basicConfig(format='%(levelname)s %(message)s')
-logger = logging.getLogger('pyro')
-logger.setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 T = namedtuple("TestGPModel", ["model_class", "X", "y", "kernel", "likelihood"])
 
@@ -332,9 +330,10 @@ def _pre_test_mean_function():
     def f(x):
         return 2 * x + 3 + 5 * torch.sin(7 * x)
 
-    X = torch.arange(100)
+    tensor_holder = torch.tensor([])
+    X = tensor_holder.new_tensor(torch.arange(100))
     y = f(X)
-    Xnew = torch.arange(100, 150)
+    Xnew = tensor_holder.new_tensor(torch.arange(100, 150))
     ynew = f(Xnew)
 
     kernel = Cosine(input_dim=1)

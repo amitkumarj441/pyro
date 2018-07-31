@@ -12,7 +12,7 @@ import pyro.poutine as poutine
 from pyro.infer.mcmc.trace_kernel import TraceKernel
 from pyro.ops.dual_averaging import DualAveraging
 from pyro.ops.integrator import single_step_velocity_verlet, velocity_verlet
-from pyro.util import torch_isinf, torch_isnan
+from pyro.util import torch_isinf, torch_isnan, optional
 
 
 class HMC(TraceKernel):
@@ -200,7 +200,8 @@ class HMC(TraceKernel):
             z = {name: node["value"] for name, node in trace.iter_stochastic_nodes()}
             for name, transform in self.transforms.items():
                 z[name] = transform(z[name])
-            self.step_size = self._find_reasonable_step_size(z)
+            with pyro.validation_enabled(False):
+                self.step_size = self._find_reasonable_step_size(z)
             self.num_steps = max(1, int(self.trajectory_length / self.step_size))
             # make prox-center for Dual Averaging scheme
             loc = math.log(10 * self.step_size)
@@ -226,8 +227,7 @@ class HMC(TraceKernel):
 
         # Temporarily disable distributions args checking as
         # NaNs are expected during step size adaptation
-        dist_arg_check = False if self._adapt_phase else pyro.distributions.is_validation_enabled()
-        with dist.validation_enabled(dist_arg_check):
+        with optional(pyro.validation_enabled(False), self._adapt_phase):
             z_new, r_new = velocity_verlet(z, r,
                                            self._potential_energy,
                                            self.step_size,
